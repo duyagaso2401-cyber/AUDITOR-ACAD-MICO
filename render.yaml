@@ -1,0 +1,35 @@
+# Blueprint de Render: New + > Blueprint > seleccione este repositorio.
+services:
+  - type: web
+    name: auditor-academico
+    runtime: python
+    plan: starter            # 'free' funciona, pero se suspende tras inactividad
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 4 --worker-class gthread --timeout 180 --bind 0.0.0.0:$PORT --access-logfile -
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: SECRET_KEY
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_FALLBACK_MODELS
+        value: gemini-3.5-flash
+      - key: OPENALEX_API_KEY
+        sync: false
+      - key: SERPER_API_KEY
+        sync: false
+      - key: SEMANTIC_SCHOLAR_API_KEY
+        sync: false
+      - key: CONTACT_EMAIL
+        sync: false
+      - key: API_KEYS
+        sync: false
+      - key: CORS_ORIGINS
+        value: ""
+      - key: RATE_LIMIT_PER_MIN
+        value: "20"

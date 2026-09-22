@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auditor Académico · Integridad, IA y Similitud</title>
+  <meta name="description" content="Auditoría académica: detección de IA, similitud con literatura científica y reescritura con normas UPEL, APA 7, IEEE y Vancouver.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%232f5bd3'/><path d='M9 22l7-13 7 13M12 17h8' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v={{ version }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">A</span>
+    <div>
+      <strong>Auditor Académico</strong>
+      <small>IA · Similitud · Estilo institucional</small>
+    </div>
+  </div>
+  <div class="status">
+    <span class="pill {{ 'on' if gemini_enabled else 'off' }}" title="Capa semántica">
+      Gemini {{ 'activo' if gemini_enabled else 'no configurado' }}
+    </span>
+    <span class="pill on" title="Fuentes de cotejo">{{ providers|length }} fuentes</span>
+    <button class="icon-btn" id="themeToggle" aria-label="Cambiar tema">◐</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ===================== PANEL DE ENTRADA ===================== -->
+  <section class="card input-card" aria-labelledby="inTitle">
+    <h2 id="inTitle">1 · Documento</h2>
+
+    <label class="field">
+      <span>Norma institucional</span>
+      <select id="institution">
+        {% set groups = institutions|groupby('group') %}
+        {% for group in groups %}
+          <optgroup label="{{ group.grouper }}">
+            {% for inst in group.list %}
+              <option value="{{ inst.id }}" {% if inst.id == 'unicartagena_apa7' %}selected{% endif %}
+                      data-ai="{{ inst.ai_threshold }}" data-sim="{{ inst.similarity_threshold }}"
+                      data-notes="{{ inst.notes|join(' · ') }}" data-style="{{ inst.citation_style }}">
+                {{ inst.name }}
+              </option>
+            {% endfor %}
+          </optgroup>
+        {% endfor %}
+      </select>
+      <small id="instNotes" class="muted"></small>
+    </label>
+
+    <label class="dropzone" id="dropzone">
+      <input type="file" id="fileInput" accept=".docx,.pdf,.txt,.md" hidden>
+      <span class="dz-icon" aria-hidden="true">⇪</span>
+      <span><strong>Arrastra un .docx, .pdf o .txt</strong> o haz clic para seleccionarlo</span>
+      <small id="fileName" class="muted"></small>
+    </label>
+
+    <label class="field">
+      <span>Texto a auditar <small class="muted" id="charCount">0 caracteres</small></span>
+      <textarea id="textInput" rows="14" placeholder="Pega aquí el texto del trabajo de grado, artículo o ensayo…"></textarea>
+    </label>
+
+    <div class="grid-2">
+      <label class="field"><span>Título (para el .docx)</span><input id="docTitle" type="text" placeholder="Título del trabajo"></label>
+      <label class="field"><span>Autor</span><input id="docAuthor" type="text" placeholder="Nombre del autor"></label>
+    </div>
+
+    <fieldset class="options">
+      <legend>Motores</legend>
+      <label class="switch"><input type="checkbox" id="optGemini" {% if gemini_enabled %}checked{% else %}disabled{% endif %}><span></span> Auditoría semántica (Gemini 2.5)</label>
+      <label class="switch"><input type="checkbox" id="optPlag" checked><span></span> Cotejo en repositorios académicos</label>
+      <div class="providers">
+        {% for p in providers %}
+          <label class="chip"><input type="checkbox" name="provider" value="{{ p }}" checked> {{ {'openalex':'OpenAlex','crossref':'Crossref','semantic_scholar':'Semantic Scholar','google_scholar':'Google Scholar','web':'Web / Repositorios'}[p] }}</label>
+        {% endfor %}
+      </div>
+      <label class="field inline"><span>Fragmentos a cotejar</span>
+        <input type="range" id="optFragments" min="3" max="20" value="8"><output id="fragOut">8</output></label>
+    </fieldset>
+
+    <button class="btn primary big" id="auditBtn">Auditar documento</button>
+    <p class="muted tiny">Los resultados son indicios probabilísticos que deben ser valorados por un evaluador humano.</p>
+  </section>
+
+  <!-- ===================== RESULTADOS ===================== -->
+  <section class="results" id="results" aria-live="polite">
+    <div class="empty" id="emptyState">
+      <div class="empty-art" aria-hidden="true">
+        <svg viewBox="0 0 120 80"><rect x="8" y="10" width="70" height="60" rx="6" class="e1"/><path d="M18 26h50M18 36h40M18 46h46M18 56h28" class="e2"/><circle cx="88" cy="46" r="18" class="e3"/><path d="M101 59l12 12" class="e3s"/></svg>
+      </div>
+      <h3>Sin auditoría todavía</h3>
+      <p class="muted">Carga un documento o pega un texto y pulsa <strong>Auditar documento</strong>.</p>
+    </div>
+
+    <div class="loading hidden" id="loading">
+      <div class="spinner"></div>
+      <ol class="steps">
+        <li data-step="0">Segmentando oraciones y calculando burstiness…</li>
+        <li data-step="1">Estimando perplejidad y muletillas…</li>
+        <li data-step="2">Auditoría semántica con Gemini…</li>
+        <li data-step="3">Consultando OpenAlex, Crossref y Semantic Scholar…</li>
+        <li data-step="4">Construyendo el mapa de riesgo…</li>
+      </ol>
+    </div>
+
+    <div id="report" class="hidden">
+      <div class="verdict" id="verdict"></div>
+
+      <div class="kpis">
+        <div class="card gauge-card"><div class="gauge" id="gAI"></div><h4>Probabilidad de IA</h4><small class="muted" id="gAIsub"></small></div>
+        <div class="card gauge-card"><div class="gauge" id="gSIM"></div><h4>Índice de similitud</h4><small class="muted" id="gSIMsub"></small></div>
+        <div class="card gauge-card"><div class="gauge" id="gINT"></div><h4>Integridad global</h4><small class="muted" id="gINTsub"></small></div>
+      </div>
+
+      <div class="stats" id="stats"></div>
+
+      <nav class="tabs" role="tablist">
+        <button role="tab" class="active" data-tab="map">Mapa de texto</button>
+        <button role="tab" data-tab="sources">Fuentes <span class="badge" id="srcCount">0</span></button>
+        <button role="tab" data-tab="rewrite">Reescritura <span class="badge" id="rwCount">0</span></button>
+        <button role="tab" data-tab="metrics">Métricas</button>
+        <button role="tab" data-tab="api">API</button>
+      </nav>
+
+      <!-- Mapa de texto -->
+      <div class="tabpane active" id="tab-map">
+        <div class="legend">
+          <span><i class="lg ia_alta"></i>IA alta</span>
+          <span><i class="lg ia_media"></i>IA media</span>
+          <span><i class="lg plagio"></i>Coincidencia con fuente</span>
+          <span><i class="lg relacionada"></i>Fuente relacionada</span>
+        </div>
+        <div class="card doc-map" id="docMap"></div>
+        <aside class="card detail hidden" id="sentenceDetail"></aside>
+      </div>
+
+      <!-- Fuentes -->
+      <div class="tabpane" id="tab-sources">
+        <div id="providerErrors"></div>
+        <div id="sourcesList" class="sources"></div>
+      </div>
+
+      <!-- Reescritura -->
+      <div class="tabpane" id="tab-rewrite">
+        <div class="card toolbar">
+          <label class="field inline"><span>Modo</span>
+            <select id="rwMode">
+              {% for key, desc in modes.items() %}<option value="{{ key }}" title="{{ desc }}" {% if key=='fluido' %}selected{% endif %}>{{ {'fluido':'Humanizado / fluido','academico':'Académico formal','conciso':'Conciso'}[key] }}</option>{% endfor %}
+            </select>
+          </label>
+          <button class="btn primary" id="rewriteAllBtn">Reescribir fragmentos marcados</button>
+          <button class="btn" id="applyBtn" disabled>Aplicar cambios aceptados</button>
+          <span class="spacer"></span>
+          <label class="switch small"><input type="checkbox" id="includeReport" checked><span></span> Anexar informe</label>
+          <button class="btn accent" id="exportBtn">Descargar .docx</button>
+        </div>
+        <p class="muted tiny" id="rwEngine"></p>
+        <div id="rewriteList" class="rewrites"></div>
+        <details class="card">
+          <summary>Vista previa del texto final</summary>
+          <div id="finalPreview" class="final-preview"></div>
+        </details>
+      </div>
+
+      <!-- Métricas -->
+      <div class="tabpane" id="tab-metrics">
+        <div class="grid-2">
+          <div class="card"><h4>Longitud de oraciones (burstiness)</h4><div id="burstChart" class="chart"></div>
+            <p class="muted tiny">Cada barra es una oración; la altura es su número de palabras y el color, su riesgo de IA. El texto humano muestra picos y valles; el generado tiende a una “meseta”.</p></div>
+          <div class="card"><h4>Sub-puntuaciones del motor matemático</h4><div id="subscores"></div></div>
+        </div>
+        <div class="card"><h4>Dictamen semántico</h4><div id="semantic"></div></div>
+      </div>
+
+      <!-- API -->
+      <div class="tabpane" id="tab-api">
+        <div class="card">
+          <h4>Integración REST</h4>
+          <p class="muted">Endpoint: <code>POST /api/v1/audit</code> · Autenticación: cabecera <code>X-API-Key</code> (si el servidor define <code>API_KEYS</code>).</p>
+<pre class="code" id="curlSample"></pre>
+          <button class="btn" id="downloadJson">Descargar informe JSON</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot muted tiny">Auditor Académico v{{ version }} · Fuentes abiertas: OpenAlex, Crossref, Semantic Scholar{% if 'google_scholar' in providers %}, Google Scholar{% endif %} · Úselo como apoyo a la evaluación, no como prueba única.</footer>
+
+<div class="toast hidden" id="toast" role="status"></div>
+<script src="{{ url_for('static', filename='app.js') }}?v={{ version }}"></script>
+</body>
+</html>
