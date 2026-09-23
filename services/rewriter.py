@@ -1,7 +1,7 @@
 """
 Motor de reescritura / parafraseo con estilo institucional.
 
-Modo principal: Gemini 2.5 con instrucciones de estilo de la institución.
+Modo principal: motor de IA seleccionado (Gemini o Claude) con instrucciones de estilo de la institución.
 Modo de respaldo (sin clave): reglas locales — sustituye muletillas, elimina
 fórmulas vacías y divide oraciones excesivamente largas.
 
@@ -24,8 +24,7 @@ import re
 import time
 from dataclasses import dataclass
 
-from .gemini_client import (GeminiAuthError, GeminiClient, GeminiError, GeminiRateLimitError,
-                            GeminiTimeoutError)
+from .llm import LLMAuthError, LLMError, LLMRateLimitError, LLMTimeoutError
 from .institutions import Institution
 from .text_utils import TRANSITIONS_EN, TRANSITIONS_ES, Sentence
 
@@ -47,7 +46,7 @@ _SYSTEM = (
     "mismo idioma del original. Responde SOLO con JSON válido."
 )
 
-# Oraciones por llamada a Gemini. Lotes pequeños => cada llamada tarda pocos segundos
+# Oraciones por llamada al motor de IA. Lotes pequeños => cada llamada tarda pocos segundos
 # y consume pocos tokens por minuto (clave en el plan gratuito de Gemini y de Render).
 BATCH_SIZE = max(1, int(os.getenv("REWRITE_BATCH_SIZE", "4")))
 CONTEXT_CHARS = 220          # contexto local antes/después de cada oración
@@ -57,7 +56,7 @@ MAX_SEGMENT_CHARS = 1500     # una "oración" más larga que esto se recorta al 
 @dataclass
 class Segment:
     """Unidad mínima de reescritura: la oración y su contexto local inmediato.
-    Nunca se envía el documento completo a Gemini."""
+    Nunca se envía el documento completo al motor de IA."""
     index: int
     text: str
     before: str = ""
@@ -75,15 +74,15 @@ def segments_from_sentences(sentences: list[Sentence], targets: list[int]) -> li
     return out
 
 
-def rewrite_segments(segments: list[Segment], institution: Institution, client: GeminiClient | None,
+def rewrite_segments(segments: list[Segment], institution: Institution, client,
                      mode: str = "fluido", budget: float | None = None,
                      raise_rate_limit: bool = True) -> dict:
     """
     Reescribe segmentos en lotes de ``BATCH_SIZE`` respetando un presupuesto de tiempo.
 
-    * ``GeminiRateLimitError`` se propaga (si ``raise_rate_limit``) para que la API responda
+    * ``LLMRateLimitError`` se propaga (si ``raise_rate_limit``) para que la API responda
       429 + Retry-After y el cliente reintente ese lote, en vez de degradar la calidad.
-    * Timeout, clave inválida u otros fallos de Gemini => respaldo local por reglas y
+    * Timeout, clave inválida u otros fallos del motor de IA => respaldo local por reglas y
       ``warning`` explicativo, para que el usuario siempre obtenga un resultado.
     """
     mode = mode if mode in MODES else "fluido"
@@ -99,39 +98,43 @@ def rewrite_segments(segments: list[Segment], institution: Institution, client: 
         remaining = (deadline - time.monotonic()) if deadline else None
         try:
             if remaining is not None and remaining < 4:
-                raise GeminiTimeoutError("Presupuesto de tiempo agotado")
+                raise LLMTimeoutError("Presupuesto de tiempo agotado")
             rewrites += _rewrite_with_gemini(batch, institution, client, mode, remaining)
-        except GeminiRateLimitError:
+        except LLMRateLimitError:
             if raise_rate_limit:
                 raise
-            return _with_local_fallback(rewrites, segments[b:], "cuota de Gemini excedida", client)
-        except GeminiTimeoutError:
-            return _with_local_fallback(rewrites, segments[b:], "Gemini tardó demasiado", client)
-        except GeminiAuthError as exc:
+            return _with_local_fallback(rewrites, segments[b:], "cuota de uso excedida temporalmente", client)
+        except LLMTimeoutError:
+            return _with_local_fallback(rewrites, segments[b:], "el motor de IA tardó demasiado", client)
+        except LLMAuthError as exc:
             return _with_local_fallback(rewrites, segments[b:], str(exc), client)
-        except GeminiError as exc:
+        except LLMError as exc:
             log.warning("Lote de reescritura falló: %s", exc)
-            return _with_local_fallback(rewrites, segments[b:], "respuesta inválida de Gemini", client)
-    return {"engine": f"gemini:{client.model}", "mode": mode, "rewrites": rewrites}
+            return _with_local_fallback(rewrites, segments[b:], "respuesta inválida del motor de IA", client)
+    return {"engine": _engine(client), "mode": mode, "rewrites": rewrites}
+
+
+def _engine(client) -> str:
+    return f"{getattr(client, 'name', 'ia')}:{client.model}"
 
 
 def _with_local_fallback(done: list[dict], pending: list[Segment], reason: str, client) -> dict:
     local = _rewrite_local(pending)
-    return {"engine": f"gemini:{client.model}+local-rules" if done else "local-rules",
+    return {"engine": f"{_engine(client)}+local-rules" if done else "local-rules",
             "mode": "mixto" if done else "reglas",
             "rewrites": done + local["rewrites"],
             "warning": f"{len(pending)} oración(es) procesadas con el motor local: {reason}."}
 
 
 def rewrite_sentences(sentences: list[Sentence], targets: list[int], institution: Institution,
-                      client: GeminiClient | None, mode: str = "fluido",
+                      client, mode: str = "fluido",
                       budget: float | None = None, raise_rate_limit: bool = False) -> dict:
     """Compatibilidad: reescribe por índices a partir de la lista completa de oraciones."""
     return rewrite_segments(segments_from_sentences(sentences, targets), institution, client,
                             mode, budget, raise_rate_limit)
 
 
-def _rewrite_with_gemini(batch: list[Segment], institution: Institution, client: GeminiClient,
+def _rewrite_with_gemini(batch: list[Segment], institution: Institution, client,
                          mode: str, budget: float | None) -> list[dict]:
     items = [{"index": s.index, "before": s.before[-CONTEXT_CHARS:], "text": s.text,
               "after": s.after[:CONTEXT_CHARS]} for s in batch]
@@ -219,7 +222,7 @@ def _rewrite_local(segments: list[Segment]) -> dict:
         if new != original:
             rewrites.append({"index": i, "original": original, "rewritten": new, "changes": changes})
     return {"engine": "local-rules", "mode": "reglas", "rewrites": rewrites,
-            "note": "Configure GEMINI_API_KEY para obtener paráfrasis completas con estilo institucional."}
+            "note": "Configure un motor de IA (GEMINI_API_KEY o ANTHROPIC_API_KEY) para obtener paráfrasis completas."}
 
 
 def _match_case(src: str, repl: str) -> str:

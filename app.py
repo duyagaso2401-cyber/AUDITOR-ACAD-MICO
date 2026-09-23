@@ -1,7 +1,7 @@
 """
 Auditor Académico – Plataforma web de auditoría de integridad académica.
 
-    * Detección dual de IA (métricas locales de burstiness/perplejidad + Gemini 2.5).
+    * Detección dual de IA (métricas locales de burstiness/perplejidad + Gemini 2.5 o Claude).
     * Cotejo de similitud contra OpenAlex, Crossref, Semantic Scholar y Google Scholar/Web (Serper).
     * Reescritura con estilo institucional (UPEL, APA 7, IEEE, Vancouver) y exportación .docx.
     * Dashboard web y API REST versionada (/api/v1).
@@ -11,7 +11,9 @@ Producción:        gunicorn app:app  (ver Procfile / render.yaml)
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
+import re
 import logging
 import os
 import secrets
@@ -30,9 +32,12 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from services.ai_detector import detect_ai
 from services.documents import ExtractionError, build_docx, extract_text
-from services.gemini_client import GeminiClient, GeminiRateLimitError
+from services.claude_client import ClaudeClient
+from services.gemini_client import GeminiClient
+from services.llm import QUOTA_MESSAGE, LLMRateLimitError, LLMRegistry, notice_of
 from services.institutions import get_institution, list_institutions
 from services.plagiarism import available_providers, check_plagiarism
+from services.projects import ProjectError, create_store, normalize_project
 from services.rewriter import (BATCH_SIZE, MAX_SEGMENT_CHARS, MODES, Segment, apply_rewrites,
                                rewrite_segments, rewrite_sentences, segments_from_sentences)
 from services.text_utils import detect_language, normalize, split_sentences
@@ -44,7 +49,7 @@ MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "80000"))
 MIN_TEXT_CHARS = 80
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "20"))
 # Reescritura: máximo de oraciones por petición HTTP y segundos máximos por petición.
-# 5 oraciones ≈ 1-2 lotes de Gemini ≈ 4-10 s: muy por debajo del timeout del proxy.
+# 5 oraciones ≈ 1-2 lotes del motor de IA ≈ 4-10 s: muy por debajo del timeout del proxy.
 REWRITE_MAX_PER_REQUEST = int(os.getenv("REWRITE_MAX_PER_REQUEST", "5"))
 REWRITE_TIME_BUDGET = float(os.getenv("REWRITE_TIME_BUDGET", "20"))
 # Las peticiones de reescritura por lotes son muchas y pequeñas: tienen su propio límite.
@@ -70,6 +75,8 @@ app.json.ensure_ascii = False
 app.json.sort_keys = False
 
 gemini = GeminiClient()
+claude = ClaudeClient()
+llms = LLMRegistry({"gemini": gemini, "claude": claude})   # selector multi-LLM (parámetro "provider")
 _executor = ThreadPoolExecutor(max_workers=int(os.getenv("WORKERS_THREADS", "8")))
 
 
@@ -101,6 +108,8 @@ class RateLimiter:
 
 limiter = RateLimiter(RATE_LIMIT_PER_MIN)
 rewrite_limiter = RateLimiter(REWRITE_RATE_LIMIT_PER_MIN)
+projects_limiter = RateLimiter(int(os.getenv("PROJECTS_RATE_LIMIT_PER_MIN", "60")))
+project_store = create_store()
 
 
 def api_error(message: str, status: int = 400, **extra):
@@ -149,8 +158,8 @@ def _after(resp: Response):
     if request.path.startswith("/api/") and origin and ("*" in CORS_ORIGINS or origin in CORS_ORIGINS):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, X-Request-ID"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, X-Request-ID, X-Client-Id"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
         resp.headers["Access-Control-Expose-Headers"] = "X-Request-ID, Content-Disposition"
     if request.path.startswith("/api/"):
         log.info("%s %s %s %.0fms", request.method, request.path, resp.status_code,
@@ -207,9 +216,18 @@ def _as_bool(value, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "si", "sí", "on"}
 
 
+def _llm_info(requested: str, client, notice: str | None) -> dict:
+    return {"requested": requested,
+            "used": getattr(client, "name", None) if client is not None else None,
+            "model": getattr(client, "model", None) if client is not None else None,
+            "notice": notice_of(client, notice)}
+
+
 def run_audit(text: str, opts: dict) -> dict:
     institution = get_institution(opts.get("institution"))
-    use_gemini = _as_bool(opts.get("use_gemini"), True)
+    # "provider" = motor de IA (gemini | claude). No confundir con "providers" (fuentes de cotejo).
+    llm, llm_notice, llm_requested = llms.for_request(opts.get("provider") or opts.get("ai_provider"))
+    use_semantic = _as_bool(opts.get("use_semantic", opts.get("use_gemini")), True)
     do_plagiarism = _as_bool(opts.get("check_plagiarism"), True)
     auto_rewrite = _as_bool(opts.get("rewrite"), False)
     max_fragments = max(1, min(int(opts.get("max_fragments", 8) or 8), 20))
@@ -221,7 +239,7 @@ def run_audit(text: str, opts: dict) -> dict:
     lang = detect_language(text)
     sentences = split_sentences(text)
 
-    ai_future = _executor.submit(detect_ai, sentences, text, lang, institution, gemini, use_gemini)
+    ai_future = _executor.submit(detect_ai, sentences, text, lang, institution, llm, use_semantic)
     pl_future = (_executor.submit(check_plagiarism, sentences, lang, providers, max_fragments,
                                   institution.similarity_threshold)
                  if do_plagiarism else None)
@@ -251,7 +269,7 @@ def run_audit(text: str, opts: dict) -> dict:
     targets = [s["index"] for s in sentence_map if s["flag"] in ("plagio", "ia_alta", "ia_media")]
     rewrite = None
     if auto_rewrite and targets:
-        rewrite = rewrite_sentences(sentences, targets[:REWRITE_MAX_PER_REQUEST * 3], institution, gemini,
+        rewrite = rewrite_sentences(sentences, targets[:REWRITE_MAX_PER_REQUEST * 3], institution, llm,
                                     opts.get("mode", "fluido"), budget=REWRITE_TIME_BUDGET)
         rewrite["corrected_text"] = apply_rewrites(text, sentences, rewrite["rewrites"])
 
@@ -264,6 +282,7 @@ def run_audit(text: str, opts: dict) -> dict:
         "version": APP_VERSION,
         "institution": institution.to_public(),
         "language": lang,
+        "llm": _llm_info(llm_requested, llm, llm_notice),
         "summary": {
             "ai_probability": ai_pct,
             "ai_level": ai["level"],
@@ -307,14 +326,16 @@ def _validate_text(text: str):
 def index():
     session["ui"] = True  # autoriza al dashboard a usar la API sin exponer claves
     return render_template("index.html", institutions=list_institutions(),
-                           gemini_enabled=gemini.enabled, providers=available_providers(),
+                           gemini_enabled=gemini.enabled, llm_status=llms.status(),
+                           llm_any=llms.any_enabled(), providers=available_providers(),
+                           llm_active=[st["label"].split(" ")[-1] for st in llms.status().values() if st["enabled"]],
                            modes=MODES, version=APP_VERSION)
 
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "version": APP_VERSION, "gemini": gemini.enabled,
-                    "gemini_model": gemini.model, "providers": available_providers()})
+    return jsonify({"status": "ok", "version": APP_VERSION, "llm": llms.status(),
+                    "providers": available_providers()})
 
 
 # --------------------------------------------------------------------------- #
@@ -330,6 +351,10 @@ def api_index():
             "POST /api/v1/export": "Genera .docx corregido (con anexo de informe opcional).",
             "POST /api/v1/extract": "Extrae texto de .docx/.pdf/.txt.",
             "GET  /api/v1/institutions": "Perfiles institucionales disponibles.",
+            "POST /api/v1/projects/save": "Guarda/actualiza un proyecto (borrador) con su estado completo.",
+            "GET  /api/v1/projects/load?id=": "Recupera un proyecto guardado.",
+            "GET  /api/v1/projects": "Lista proyectos (filtros: institucion_id, docente_id, asignatura, grado, status).",
+            "DELETE /api/v1/projects/<id>": "Elimina un proyecto.",
         },
         "auth": "Cabecera X-API-Key" if API_KEYS else "Abierta (defina API_KEYS en producción)",
     })
@@ -362,7 +387,8 @@ def api_audit():
         {
           "text": "...",                         # o multipart con 'file'
           "institution": "upel|unicartagena_apa7|ieee|vancouver",
-          "use_gemini": true,
+          "provider": "gemini|claude",          # motor de IA (por defecto gemini)
+          "use_semantic": true,
           "check_plagiarism": true,
           "providers": ["openalex","crossref","semantic_scholar","google_scholar","web"],
           "max_fragments": 8,
@@ -420,7 +446,9 @@ def api_rewrite():
     procesa los primeros N y devuelve "pending" con los que faltan para la siguiente llamada.
         {"text": "...", "indices": [3, 7, 12, ...], "institution": "upel"}
 
-    Errores: 400 (petición inválida), 413 (demasiados segmentos), 429 (cuota de Gemini o
+    Parámetro opcional "provider": "gemini" (defecto) | "claude".
+
+    Errores: 400 (petición inválida), 413 (demasiados segmentos), 429 (cuota de uso o
     límite de la API, con Retry-After), 500 (error inesperado, siempre en JSON).
     """
     body = request.get_json(silent=True)
@@ -458,11 +486,12 @@ def api_rewrite():
         return api_error(str(exc), 400)
 
     try:
-        result = rewrite_segments(segments, institution, gemini, mode,
+        llm, llm_notice, llm_requested = llms.for_request(body.get("provider") or body.get("ai_provider"))
+        result = rewrite_segments(segments, institution, llm, mode,
                                   budget=REWRITE_TIME_BUDGET, raise_rate_limit=True)
-    except GeminiRateLimitError as exc:
+    except LLMRateLimitError as exc:
         retry = max(1, int(round(exc.retry_after)))
-        resp, status = api_error("Cuota de Gemini excedida temporalmente; reintente este lote", 429,
+        resp, status = api_error(f"{QUOTA_MESSAGE}; reintente este lote en unos segundos", 429,
                                  retry_after=retry, retryable=True)
         resp.headers["Retry-After"] = str(retry)
         return resp, status
@@ -480,9 +509,86 @@ def api_rewrite():
         "done": not pending,
         "max_per_request": REWRITE_MAX_PER_REQUEST,
         "batch_size": BATCH_SIZE,
+        "llm": _llm_info(llm_requested, llm, llm_notice),
         **result,
         **({"corrected_text": corrected_text} if corrected_text is not None else {}),
     })
+
+
+# --------------------------------------------------------------------------- #
+#  Proyectos (borradores persistentes)
+# --------------------------------------------------------------------------- #
+_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9-]{16,64}$")
+
+
+def _project_owner() -> str:
+    """Propietario del proyecto.
+    * Integraciones: hash de la API key (nunca se guarda la clave en claro).
+    * Dashboard: identificador anónimo del navegador (cabecera X-Client-Id).
+    Cuando exista autenticación de usuarios, devolver aquí el user_id y aplicar roles."""
+    key = request.headers.get("X-API-Key")
+    if key and _valid_api_key(key):
+        return "key:" + hashlib.sha256(key.encode()).hexdigest()[:32]
+    client_id = request.headers.get("X-Client-Id", "")
+    if not _CLIENT_ID_RE.match(client_id):
+        raise ProjectError("Falta la cabecera X-Client-Id (16-64 caracteres alfanuméricos)")
+    return "client:" + client_id
+
+
+def _project_error(exc: ProjectError):
+    return api_error(str(exc), getattr(exc, "status", 400))
+
+
+@app.post("/api/v1/projects/save")
+@protected(bucket=projects_limiter)
+def api_project_save():
+    """Crea o actualiza (upsert) un proyecto con su estado completo.
+    Respuestas: 201 creado · 200 actualizado · 400 inválido · 404 ajeno · 409 versión obsoleta."""
+    body = request.get_json(silent=True)
+    try:
+        owner = _project_owner()
+        project = normalize_project(body)
+        meta = project_store.save(project, owner)
+    except ProjectError as exc:
+        return _project_error(exc)
+    return jsonify({"ok": True, "project": meta}), (201 if meta["created"] else 200)
+
+
+@app.get("/api/v1/projects/load")
+@protected(rate_limited=False)
+def api_project_load():
+    project_id = request.args.get("id", "")
+    try:
+        owner = _project_owner()
+        project = project_store.load(project_id, owner)
+    except ProjectError as exc:
+        return _project_error(exc)
+    return jsonify({"ok": True, "project": project})
+
+
+@app.get("/api/v1/projects")
+@protected(rate_limited=False)
+def api_project_list():
+    """Lista los proyectos del propietario. Filtros opcionales por contexto académico:
+    ?institucion_id=&docente_id=&asignatura=&grado=&status=&limit="""
+    try:
+        owner = _project_owner()
+        limit = int(request.args.get("limit", 20))
+    except ProjectError as exc:
+        return _project_error(exc)
+    except ValueError:
+        return api_error("'limit' debe ser un entero", 400)
+    return jsonify({"ok": True, "projects": project_store.list(owner, request.args.to_dict(), limit)})
+
+
+@app.delete("/api/v1/projects/<project_id>")
+@protected(rate_limited=False)
+def api_project_delete(project_id: str):
+    try:
+        project_store.delete(project_id, _project_owner())
+    except ProjectError as exc:
+        return _project_error(exc)
+    return jsonify({"ok": True})
 
 
 @app.post("/api/v1/export")

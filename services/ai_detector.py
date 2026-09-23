@@ -13,7 +13,7 @@ Motor dual de detección de texto generado por IA.
    - Uniformidad estructural: repetición de arranques de oración y pobreza de
      puntuación expresiva.
 
-2) Capa SEMÁNTICA (Gemini 2.5)
+2) Capa SEMÁNTICA (motor de IA seleccionado: Gemini 2.5 o Claude)
    - Evalúa predictibilidad del discurso, muletillas robóticas, genericidad y
      ausencia de voz autoral; marca oraciones concretas.
 
@@ -29,14 +29,14 @@ import os
 import statistics
 from collections import Counter
 
-from .gemini_client import GeminiClient, GeminiError
+from .llm import LLMError
 from .institutions import Institution
 from .text_utils import (STOPWORDS_EN, STOPWORDS_ES, Sentence, clamp, find_markers,
                          tokenize)
 
 log = logging.getLogger(__name__)
 
-LOCAL_WEIGHT = 0.40          # peso de la capa matemática cuando hay Gemini
+LOCAL_WEIGHT = 0.40          # peso de la capa matemática cuando hay motor de IA
 SEMANTIC_WEIGHT = 0.60
 MAX_SENTENCES_TO_LLM = 160
 
@@ -198,7 +198,7 @@ def _local_sentence_scores(sentences, token_lists, ppls, mean_len, std_len) -> l
 
 
 # --------------------------------------------------------------------------- #
-#  Capa semántica (Gemini)
+#  Capa semántica (Gemini o Claude)
 # --------------------------------------------------------------------------- #
 _SYSTEM_SEMANTIC = (
     "Eres un lingüista forense experto en detección de texto generado por modelos de lenguaje "
@@ -235,18 +235,18 @@ TEXTO:
 
 
 def semantic_analysis(sentences: list[Sentence], institution: Institution,
-                      client: GeminiClient) -> dict:
+                      client) -> dict:
     if not client.enabled:
-        return {"available": False, "error": "Gemini no configurado (GEMINI_API_KEY)"}
+        return {"available": False, "error": "Motor de IA no configurado"}
     if not sentences:
         return {"available": False, "error": "Texto vacío"}
     prompt, _ = _build_semantic_prompt(sentences, institution)
     try:
         # Presupuesto acotado: en documentos largos la auditoría no debe superar el
-        # timeout del proxy; si Gemini tarda, se entrega sólo la capa matemática.
+        # timeout del proxy; si el motor tarda, se entrega sólo la capa matemática.
         data = client.generate_json(_SYSTEM_SEMANTIC, prompt, temperature=0.1, max_output_tokens=4096,
                                     retries=1, budget=float(os.getenv("AUDIT_GEMINI_BUDGET", "22")))
-    except GeminiError as exc:
+    except LLMError as exc:
         return {"available": False, "error": str(exc)}
     if not isinstance(data, dict):
         return {"available": False, "error": "Formato inesperado"}
@@ -263,6 +263,7 @@ def semantic_analysis(sentences: list[Sentence], institution: Institution,
     return {
         "available": True,
         "model": client.model,
+        "provider": getattr(client, "name", None),
         "ai_probability": int(clamp(float(data.get("ai_probability", 50)), 0, 100)),
         "predictability": int(clamp(float(data.get("predictability", 50)), 0, 100)),
         "verdict": str(data.get("verdict", "mixto")),
@@ -276,7 +277,7 @@ def semantic_analysis(sentences: list[Sentence], institution: Institution,
 #  Fusión
 # --------------------------------------------------------------------------- #
 def detect_ai(sentences: list[Sentence], text: str, lang: str, institution: Institution,
-              client: GeminiClient | None = None, use_semantic: bool = True) -> dict:
+              client=None, use_semantic: bool = True) -> dict:
     local = local_analysis(sentences, text, lang)
     semantic = (semantic_analysis(sentences, institution, client)
                 if (use_semantic and client) else {"available": False, "error": "Desactivado"})

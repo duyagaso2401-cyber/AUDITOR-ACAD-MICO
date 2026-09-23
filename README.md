@@ -15,7 +15,7 @@ ai_detector     plagiarism          rewriter            documents        institu
  ├ burstiness    ├ OpenAlex          ├ Gemini (estilo)    ├ .docx/.pdf in   UPEL · APA 7
  ├ perplejidad   ├ Crossref          └ reglas locales     └ .docx out       IEEE · Vancouver
  ├ muletillas    ├ Semantic Scholar
- └ Gemini 2.5    └ Scholar/Web (Serper)
+ └ Gemini/Claude └ Scholar/Web (Serper)
 ```
 
 ## Motores
@@ -23,9 +23,9 @@ ai_detector     plagiarism          rewriter            documents        institu
 | Motor | Qué hace | Cómo |
 |---|---|---|
 | **IA – matemático** | Burstiness (CV y B de Goh‑Barabási de la longitud de oraciones), perplejidad estimada con un bigrama interpolado *leave‑one‑sentence‑out* y su dispersión, densidad de muletillas de LLM, uniformidad estructural, MATTR. | Local, sin red, determinista. |
-| **IA – semántico** | Predictibilidad del discurso, fórmulas robóticas, genericidad, marcación por oración. | Gemini 2.5 (REST, salida JSON). Fusión 40 % local / 60 % semántico. |
+| **IA – semántico** | Predictibilidad del discurso, fórmulas robóticas, genericidad, marcación por oración. | Motor seleccionable: **Google Gemini** (defecto) o **Anthropic Claude**. Fusión 40 % local / 60 % semántico. |
 | **Similitud** | Selecciona los fragmentos más distintivos, los consulta en paralelo y compara por trigramas (copia literal) y coseno TF (paráfrasis). | OpenAlex, Crossref, Semantic Scholar y, con `SERPER_API_KEY`, Google Scholar + búsqueda web de frase exacta. |
-| **Reescritura** | Paráfrasis con fluidez humana y variabilidad sintáctica según la norma elegida; protege citas y cifras (rechaza la propuesta si las pierde). | Gemini con guía de estilo institucional; respaldo local por reglas. |
+| **Reescritura** | Paráfrasis con fluidez humana y variabilidad sintáctica según la norma elegida; protege citas y cifras (rechaza la propuesta si las pierde). | Motor seleccionado con guía de estilo institucional; respaldo local por reglas. |
 | **Exportación** | .docx con márgenes, fuente, interlineado y sangría de la institución + anexo con informe y registro de cambios. | python-docx. |
 
 ## Ejecución local
@@ -46,6 +46,8 @@ python -m pytest -q                                    # pruebas (pip install py
 | `GEMINI_API_KEY` | Recomendada | Activa la capa semántica y la reescritura completa ([AI Studio](https://aistudio.google.com/apikey)). |
 | `GEMINI_MODEL` | No | `gemini-2.5-flash` (defecto) o `gemini-2.5-pro`. |
 | `GEMINI_FALLBACK_MODELS` | No | Modelos de respaldo si la cuenta no tiene acceso a 2.5 (defecto `gemini-3.5-flash`). |
+| `ANTHROPIC_API_KEY` | No | Activa el motor **Claude** (librería oficial `anthropic`). Sin ella, elegir Claude usa Gemini y muestra un aviso. |
+| `CLAUDE_MODEL` | No | `claude-sonnet-5` (defecto), `claude-haiku-4-5-20251001` (más rápido) o `claude-opus-5-5`. |
 | `OPENALEX_API_KEY` | Recomendada | Desde feb‑2026 OpenAlex exige clave (gratuita, 100 000 créditos/día). Sin ella sólo hay 100 créditos/día. |
 | `SERPER_API_KEY` | No | Google Scholar y búsqueda web de frase exacta (repositorios institucionales). |
 | `SEMANTIC_SCHOLAR_API_KEY` | No | Mayor cuota en Semantic Scholar. |
@@ -71,7 +73,7 @@ python -m pytest -q                                    # pruebas (pip install py
 ```bash
 curl -X POST https://SU-APP.onrender.com/api/v1/audit \
   -H "Content-Type: application/json" -H "X-API-Key: SU_CLAVE" \
-  -d '{"text":"…","institution":"upel","use_gemini":true,"check_plagiarism":true,
+  -d '{"text":"…","institution":"upel","provider":"gemini","use_semantic":true,"check_plagiarism":true,
        "providers":["openalex","crossref"],"max_fragments":8,"rewrite":true,"mode":"fluido"}'
 ```
 
@@ -90,15 +92,30 @@ Respuesta (resumen):
 }
 ```
 
+`provider` elige el **motor de IA** (`"gemini"` por defecto o `"claude"`); no confundir con `providers`, que son las fuentes de cotejo. La respuesta incluye `llm: {requested, used, model, notice}`; si se pide Claude y no está configurado (o su clave es rechazada) se usa Gemini y `notice` lo indica. Los errores de cuota son neutros: `"Cuota de uso excedida temporalmente"`.
+
 **Reescritura por lotes** — `POST /api/v1/rewrite` procesa como máximo `REWRITE_MAX_PER_REQUEST` (5) oraciones por petición y responde en ≤ `REWRITE_TIME_BUDGET` (20 s):
 
 ```json
 {"segments": [{"index": 12, "text": "…", "before": "…", "after": "…"}], "institution": "upel", "mode": "fluido"}
 ```
 
-También acepta `{"text": "…", "indices": [..]}`: procesa los primeros 5 y devuelve `"pending"` con los que faltan. Códigos: `400` petición inválida, `413` demasiados segmentos, `429` cuota de Gemini (con `Retry-After`; reintente ese lote), `500` error inesperado (JSON con `request_id`). Si Gemini tarda demasiado o rechaza la clave, el lote se resuelve con el motor local y la respuesta incluye `warning`.
+También acepta `{"text": "…", "indices": [..]}`: procesa los primeros 5 y devuelve `"pending"` con los que faltan. Códigos: `400` petición inválida, `413` demasiados segmentos, `429` cuota de uso excedida (con `Retry-After`; reintente ese lote), `500` error inesperado (JSON con `request_id`). Acepta también `provider`. Si el motor tarda demasiado o rechaza la clave, el lote se resuelve con el motor local y la respuesta incluye `warning`.
 
 Otros endpoints: `POST /api/v1/export` (devuelve .docx), `POST /api/v1/extract`, `GET /api/v1/institutions`, `GET /health`. Añada `"compact": true` a `/audit` para respuestas livianas.
+
+### Proyectos y borradores
+
+El dashboard guarda el proyecto en `localStorage` en cada paso (auditoría, cada lote reescrito, ediciones) y en el servidor al auditar, al pausar, al terminar, al exportar y con **Guardar avance**. Al volver a entrar ofrece reanudar el borrador. Si la cuota de uso sigue agotada tras varios reintentos, la reescritura se **pausa** y conserva lo hecho.
+
+| Endpoint | Descripción |
+|---|---|
+| `POST /api/v1/projects/save` | Crea (201) o actualiza (200) un proyecto. `409` si `revision` está desactualizada. |
+| `GET /api/v1/projects/load?id=` | Recupera el estado completo. |
+| `GET /api/v1/projects` | Lista con filtros `institucion_id`, `docente_id`, `periodo`, `area_asignatura`, `status`. |
+| `DELETE /api/v1/projects/<id>` | Elimina. |
+
+Modelo: `{id, revision, status, title, context:{institucion_id, docente_id, periodo, area_asignatura}, document:{text, title, author, norma}, report:{…/audit…}, rewrite:{mode, paused_until, items:{"<índice>":{status, original, rewritten, accepted}}}}`. Propietario: hash de la `X-API-Key` o la cabecera `X-Client-Id` del navegador (reemplazable por el `user_id` cuando haya autenticación y roles). Almacén: SQLite (`services/projects.py`); para PostgreSQL implemente `ProjectStore` con el mismo esquema. **En el plan gratuito de Render el disco es efímero**: use un Persistent Disk (`render.yaml`) o una base de datos.
 
 Para añadir una universidad, agregue un `Institution` en `services/institutions.py` (guía de estilo, formato de página y umbrales).
 

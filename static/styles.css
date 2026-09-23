@@ -218,3 +218,25 @@ summary { cursor: pointer; font-weight: 600; }
 .rw-progress .meter i { background: var(--primary); transition: width .35s ease; }
 .rw-progress-foot { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
 .rw-progress-foot small { flex: 1; min-width: 180px; }
+
+/* ---------- Borradores: estado de guardado, banner de reanudación, pausa ---------- */
+.save-status { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.save-status.err { color: var(--danger); }
+.resume-banner { position: sticky; top: 62px; z-index: 15; margin: 1rem auto 0; max-width: 1460px; width: calc(100% - 2.5rem);
+  display: flex; gap: 1rem; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  padding: .85rem 1.1rem; border-radius: var(--radius); border: 1px solid var(--primary);
+  background: color-mix(in srgb, var(--primary) 10%, var(--surface)); box-shadow: var(--shadow); }
+.resume-body { display: flex; flex-direction: column; gap: .15rem; min-width: 240px; flex: 1; }
+.resume-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+.context-box summary { font-size: .85rem; }
+.context-box[open] summary { margin-bottom: .5rem; }
+.pause-notice { border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border-radius: 10px; padding: .65rem .8rem; font-size: .88rem; }
+.pause-notice b { display: block; margin-bottom: .2rem; }
+.rw-status { font-size: .7rem; padding: .1rem .45rem; border-radius: 6px; background: var(--surface-2); margin-left: .35rem; }
+.rw-status.fallido { color: var(--danger); } .rw-status.pendiente { color: var(--warn); }
+@media (max-width: 640px) {
+  .resume-banner { width: calc(100% - 2rem); top: 56px; }
+  #saveDraftBtn { padding: .35rem .6rem; font-size: .75rem; }
+  .save-status { display: none; }
+}

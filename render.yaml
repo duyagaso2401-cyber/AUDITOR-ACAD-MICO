@@ -19,6 +19,10 @@ services:
         value: gemini-2.5-flash
       - key: GEMINI_FALLBACK_MODELS
         value: gemini-3.5-flash
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CLAUDE_MODEL
+        value: claude-sonnet-5
       - key: OPENALEX_API_KEY
         sync: false
       - key: SERPER_API_KEY
@@ -33,3 +37,13 @@ services:
         value: ""
       - key: RATE_LIMIT_PER_MIN
         value: "20"
+    # --- Proyectos guardados en el servidor -------------------------------------------
+    # Plan gratuito: el disco es efímero; los proyectos del servidor se pierden en cada
+    # redeploy/reinicio (la copia del navegador se conserva). Con plan de pago, descomente
+    # estas líneas para usar un disco persistente:
+    #  - key: PROJECTS_DB_PATH
+    #    value: /var/data/projects.sqlite3
+    # disk:
+    #   name: auditor-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

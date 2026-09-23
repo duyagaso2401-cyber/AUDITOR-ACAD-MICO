@@ -20,13 +20,26 @@
     </div>
   </div>
   <div class="status">
-    <span class="pill {{ 'on' if gemini_enabled else 'off' }}" title="Capa semántica">
-      Gemini {{ 'activo' if gemini_enabled else 'no configurado' }}
+    <span class="save-status muted tiny" id="saveStatus" aria-live="polite"></span>
+    <button class="btn" id="saveDraftBtn" type="button" title="Guarda el avance en este navegador y en el servidor">Guardar avance</button>
+    <span class="pill {{ 'on' if llm_any else 'off' }}" title="Motores de IA configurados en el servidor">
+      IA: {{ llm_active|join(' · ') if llm_active else 'no configurada' }}
     </span>
     <span class="pill on" title="Fuentes de cotejo">{{ providers|length }} fuentes</span>
     <button class="icon-btn" id="themeToggle" aria-label="Cambiar tema">◐</button>
   </div>
 </header>
+
+<div class="resume-banner hidden" id="resumeBanner" role="dialog" aria-labelledby="resumeTitle">
+  <div class="resume-body">
+    <strong id="resumeTitle">Se encontró un borrador de auditoría anterior. ¿Deseas reanudarlo o iniciar un proyecto nuevo?</strong>
+    <small class="muted" id="resumeMeta"></small>
+  </div>
+  <div class="resume-actions">
+    <button class="btn primary" id="resumeBtn" type="button">Reanudar borrador</button>
+    <button class="btn" id="newProjectBtn" type="button">Iniciar proyecto nuevo</button>
+  </div>
+</div>
 
 <main class="layout">
   <!-- ===================== PANEL DE ENTRADA ===================== -->
@@ -69,9 +82,27 @@
       <label class="field"><span>Autor</span><input id="docAuthor" type="text" placeholder="Nombre del autor"></label>
     </div>
 
+    <details class="options context-box" id="contextBox">
+      <summary>Contexto académico <small class="muted">(opcional)</small></summary>
+      <div class="grid-2">
+        <label class="field"><span>ID institución</span><input id="ctxInstitucion" type="text" data-ctx="institucion_id" placeholder="p. ej. UDC-001"></label>
+        <label class="field"><span>ID docente</span><input id="ctxDocente" type="text" data-ctx="docente_id" placeholder="p. ej. DOC-123"></label>
+        <label class="field"><span>Periodo académico</span><input id="ctxPeriodo" type="text" data-ctx="periodo" list="periodosList" placeholder="1, 2, 3 o Periodo I"></label>
+        <label class="field"><span>Área / asignatura</span><input id="ctxArea" type="text" data-ctx="area_asignatura" placeholder="Metodología de la investigación"></label>
+      </div>
+      <datalist id="periodosList"><option value="1"><option value="2"><option value="3"><option value="Periodo I"><option value="Periodo II"><option value="Periodo III"></datalist>
+    </details>
+
     <fieldset class="options">
       <legend>Motores</legend>
-      <label class="switch"><input type="checkbox" id="optGemini" {% if gemini_enabled %}checked{% else %}disabled{% endif %}><span></span> Auditoría semántica (Gemini 2.5)</label>
+      <label class="field inline"><span>Motor de IA</span>
+        <select id="llmProvider" aria-describedby="llmHint">
+          <option value="gemini" selected>Google Gemini{% if not llm_status.gemini.enabled %} (no configurado){% endif %}</option>
+          <option value="claude">Anthropic Claude{% if not llm_status.claude.enabled %} (no configurado){% endif %}</option>
+        </select>
+      </label>
+      <small class="muted tiny" id="llmHint">Se usa para la auditoría semántica y la reescritura.</small>
+      <label class="switch"><input type="checkbox" id="optGemini" {% if llm_any %}checked{% else %}disabled{% endif %}><span></span> Auditoría semántica con IA</label>
       <label class="switch"><input type="checkbox" id="optPlag" checked><span></span> Cotejo en repositorios académicos</label>
       <div class="providers">
         {% for p in providers %}
@@ -101,7 +132,7 @@
       <ol class="steps">
         <li data-step="0">Segmentando oraciones y calculando burstiness…</li>
         <li data-step="1">Estimando perplejidad y muletillas…</li>
-        <li data-step="2">Auditoría semántica con Gemini…</li>
+        <li data-step="2">Auditoría semántica con el motor de IA…</li>
         <li data-step="3">Consultando OpenAlex, Crossref y Semantic Scholar…</li>
         <li data-step="4">Construyendo el mapa de riesgo…</li>
       </ol>
@@ -153,6 +184,7 @@
             </select>
           </label>
           <button class="btn primary" id="rewriteAllBtn">Reescribir fragmentos marcados</button>
+          <button class="btn hidden" id="resumeRewriteBtn" type="button">Reanudar reescritura pendiente</button>
           <button class="btn" id="applyBtn" disabled>Aplicar cambios aceptados</button>
           <span class="spacer"></span>
           <label class="switch small"><input type="checkbox" id="includeReport" checked><span></span> Anexar informe</label>

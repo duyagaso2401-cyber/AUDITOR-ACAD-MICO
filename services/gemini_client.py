@@ -22,32 +22,25 @@ import time
 
 import requests
 
+from .llm import (QUOTA_MESSAGE, LLMAuthError, LLMError, LLMRateLimitError, LLMTimeoutError,
+                  parse_json_text)
+
 log = logging.getLogger(__name__)
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
-class GeminiError(RuntimeError):
-    """Error genérico de Gemini (respuesta inválida, prompt bloqueado, etc.)."""
-
-
-class GeminiRateLimitError(GeminiError):
-    """Cuota agotada (HTTP 429). ``retry_after`` = segundos sugeridos por Google."""
-
-    def __init__(self, message: str, retry_after: float = 15.0):
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-class GeminiTimeoutError(GeminiError):
-    """La llamada no terminó dentro del presupuesto de tiempo de la petición."""
-
-
-class GeminiAuthError(GeminiError):
-    """Clave inválida o sin permisos (HTTP 400 por API key / 401 / 403)."""
+# Alias de compatibilidad: las excepciones son las comunes a todos los motores (services/llm.py).
+GeminiError = LLMError
+GeminiRateLimitError = LLMRateLimitError
+GeminiTimeoutError = LLMTimeoutError
+GeminiAuthError = LLMAuthError
 
 
 class GeminiClient:
+    name = "gemini"
+    label = "Google Gemini"
+
     def __init__(self, api_key: str | None = None, model: str | None = None, timeout: float | None = None):
         self.api_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY", "")
         self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -71,7 +64,7 @@ class GeminiClient:
         Si el modelo configurado no existe para la cuenta (404), prueba los de respaldo.
         """
         if not self.enabled:
-            raise GeminiError("GEMINI_API_KEY no configurada")
+            raise LLMAuthError("Motor Gemini no configurado")
         deadline = time.monotonic() + (budget if budget else self.timeout * (retries + 1) + 5)
         for model in [self.model] + self.fallbacks:
             try:
@@ -83,7 +76,7 @@ class GeminiClient:
                 return result
             except _ModelNotFound:
                 continue
-        raise GeminiError("Ningún modelo Gemini configurado está disponible para esta clave")
+        raise LLMError("Ningún modelo configurado está disponible para esta clave")
 
     def _call(self, model, system, prompt, temperature, max_output_tokens, retries, deadline):
         body = {
@@ -105,15 +98,15 @@ class GeminiClient:
         for attempt in range(retries + 1):
             remaining = deadline - time.monotonic()
             if remaining < 3:
-                raise GeminiTimeoutError("Se agotó el tiempo disponible para Gemini")
+                raise LLMTimeoutError("Se agotó el tiempo disponible para el motor de IA")
             try:
                 resp = self._session.post(url, headers=headers, json=body,
                                           timeout=(5, min(self.timeout, remaining)))
             except requests.Timeout as exc:
-                last_err = GeminiTimeoutError(f"Gemini no respondió a tiempo ({exc.__class__.__name__})")
+                last_err = LLMTimeoutError("El motor de IA no respondió a tiempo")
                 continue
             except requests.RequestException as exc:
-                last_err = GeminiError(f"Error de red con Gemini: {exc}")
+                last_err = LLMError(f"Error de red con el motor de IA: {exc.__class__.__name__}")
                 _sleep_within(deadline, 1.5 * (attempt + 1))
                 continue
 
@@ -127,21 +120,21 @@ class GeminiClient:
                 if attempt < retries and wait + 3 < deadline - time.monotonic():
                     time.sleep(wait)
                     continue
-                raise GeminiRateLimitError("Cuota de Gemini excedida (429)", retry_after=wait)
+                raise LLMRateLimitError(QUOTA_MESSAGE, retry_after=wait)
             if status in (401, 403) or (status == 400 and "API_KEY" in resp.text.upper()):
-                raise GeminiAuthError(f"Gemini rechazó la clave (HTTP {status})")
+                raise LLMAuthError(f"Clave del motor Gemini rechazada (HTTP {status})")
             if status in (500, 502, 503, 504):
-                last_err = GeminiError(f"Gemini no disponible (HTTP {status})")
+                last_err = LLMError(f"Motor de IA no disponible (HTTP {status})")
                 _sleep_within(deadline, 1.5 * (attempt + 1))
                 continue
             if status >= 400:
-                raise GeminiError(f"HTTP {status}: {resp.text[:300]}")
+                raise LLMError(f"Solicitud rechazada por el motor de IA (HTTP {status})")
             try:
-                return _parse_json(_extract_text(resp.json()))
+                return parse_json_text(_extract_text(resp.json()))
             except ValueError as exc:  # JSON truncado o mal formado: se reintenta
-                last_err = GeminiError(str(exc))
+                last_err = LLMError(str(exc))
         log.warning("Gemini falló: %s", last_err)
-        raise last_err if isinstance(last_err, GeminiError) else GeminiError(str(last_err))
+        raise last_err if isinstance(last_err, LLMError) else LLMError(str(last_err))
 
 
 def _sleep_within(deadline: float, seconds: float) -> None:
@@ -171,23 +164,9 @@ def _extract_text(payload: dict) -> str:
     candidates = payload.get("candidates") or []
     if not candidates:
         reason = payload.get("promptFeedback", {}).get("blockReason", "sin candidatos")
-        raise GeminiError(f"Respuesta vacía de Gemini ({reason})")
+        raise LLMError(f"Respuesta vacía del motor de IA ({reason})")
     parts = candidates[0].get("content", {}).get("parts", [])
     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     if not text:
-        raise GeminiError("Gemini no devolvió texto")
+        raise LLMError("El motor de IA no devolvió texto")
     return text
-
-
-def _parse_json(text: str):
-    text = text.strip()
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
-    if fenced:
-        text = fenced.group(1)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"(\{.*\}|\[.*\])", text, re.S)
-        if m:
-            return json.loads(m.group(1))
-        raise ValueError("JSON inválido devuelto por Gemini")
