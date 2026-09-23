@@ -209,3 +209,12 @@ summary { cursor: pointer; font-weight: 600; }
   .brand small { display: none; }
   .pill { font-size: .68rem; padding: .2rem .45rem; }
 }
+
+/* ---------- Progreso de reescritura por lotes ---------- */
+.rw-progress { margin-top: .8rem; display: flex; flex-direction: column; gap: .35rem; }
+.rw-progress-head { display: flex; justify-content: space-between; font-weight: 600; font-size: .9rem; }
+.rw-progress-head b { font-variant-numeric: tabular-nums; }
+.rw-progress .meter { height: 10px; margin: 0; }
+.rw-progress .meter i { background: var(--primary); transition: width .35s ease; }
+.rw-progress-foot { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.rw-progress-foot small { flex: 1; min-width: 180px; }

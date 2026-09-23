@@ -32,18 +32,34 @@
     clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.add("hidden"), ms);
   }
 
-  async function api(path, body, { raw = false } = {}) {
+  /** Llamada a la API. Los errores llevan .status, .retryAfter y .retryable para decidir reintentos. */
+  async function api(path, body, { raw = false, signal } = {}) {
     const opts = body instanceof FormData
       ? { method: "POST", body }
       : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
-    const res = await fetch(path, { credentials: "same-origin", ...opts });
+    let res;
+    try {
+      res = await fetch(path, { credentials: "same-origin", signal, ...opts });
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      throw Object.assign(new Error("Sin conexión con el servidor"), { status: 0, retryable: true });
+    }
     if (!res.ok) {
-      let msg = `Error ${res.status}`;
-      try { const j = await res.json(); msg = j.error || msg; } catch (_) {}
-      throw new Error(msg);
+      let data = {};
+      try { data = await res.json(); } catch (_) {}          // p. ej. 502/504 HTML del proxy
+      const retryAfter = +(res.headers.get("Retry-After") || data.retry_after || 0);
+      throw Object.assign(new Error(data.error || `Error ${res.status}`), {
+        status: res.status, retryAfter, data,
+        retryable: data.retryable ?? [0, 429, 500, 502, 503, 504].includes(res.status),
+      });
     }
     return raw ? res : res.json();
   }
+
+  const sleep = (ms, signal) => new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(t); reject(new DOMException("Cancelado", "AbortError")); }, { once: true });
+  });
 
   function riskColor(v, thr, invert = false) {
     const css = getComputedStyle(root);
@@ -306,25 +322,152 @@ curl -X POST ${origin}/api/v1/audit -H "X-API-Key: <SU_CLAVE>" \\
     a.click(); URL.revokeObjectURL(a.href);
   });
 
-  /* ---------------- Reescritura ---------------- */
+  /* ---------------- Reescritura por lotes ----------------
+     El documento NUNCA se envía completo: cada petición lleva ≤ REWRITE_BATCH oraciones con
+     su contexto local (oración anterior y siguiente). Así cada llamada tarda unos segundos,
+     no supera el timeout del proxy de Render y respeta la cuota por minuto de Gemini. */
+  const REWRITE_BATCH = 4;            // debe ser ≤ REWRITE_MAX_PER_REQUEST del servidor (5)
+  const MAX_ATTEMPTS = 4;             // intentos por lote (429 / 5xx / red)
+  const PAUSE_BETWEEN_BATCHES = 700;  // ms: suaviza el consumo de tokens por minuto
+  let rewriteCtrl = null;             // AbortController del proceso en curso
+  let failedIndices = [];
+
+  function buildSegments(indices) {
+    const sents = state.report.sentences;
+    return indices.map((i) => ({
+      index: i,
+      text: sents[i].text,
+      before: i > 0 ? sents[i - 1].text.slice(-220) : "",
+      after: i + 1 < sents.length ? sents[i + 1].text.slice(0, 220) : "",
+    }));
+  }
+
+  /* Panel de progreso (se crea una sola vez bajo la barra de herramientas). */
+  function progressUI() {
+    let box = $("#rwProgress");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "rwProgress"; box.className = "card rw-progress hidden";
+      box.innerHTML = `<div class="rw-progress-head"><span id="rwProgLabel"></span><b id="rwProgPct">0%</b></div>
+        <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100"><i id="rwProgBar" style="width:0%"></i></div>
+        <div class="rw-progress-foot"><small class="muted" id="rwProgSub"></small>
+        <button class="btn" id="rwCancel" type="button">Cancelar</button></div>`;
+      $("#tab-rewrite .toolbar").after(box);
+      $("#rwCancel").addEventListener("click", () => rewriteCtrl?.abort());
+    }
+    return {
+      show() { box.classList.remove("hidden"); $("#rwCancel").classList.remove("hidden"); },
+      hide() { box.classList.add("hidden"); },
+      set(done, total, label, sub = "") {
+        const pct = total ? Math.round((done / total) * 100) : 0;
+        $("#rwProgBar").style.width = pct + "%";
+        box.querySelector("[role=progressbar]").setAttribute("aria-valuenow", pct);
+        $("#rwProgPct").textContent = pct + "%";
+        $("#rwProgLabel").textContent = label;
+        $("#rwProgSub").textContent = sub;
+      },
+    };
+  }
+
   async function rewrite(indices, single = false) {
     if (!state.report) return;
+    indices = [...new Set(indices)].filter((i) => state.report.sentences[i]);
     if (!indices.length) return toast("No hay fragmentos marcados para reescribir.");
+    if (rewriteCtrl) return toast("Ya hay una reescritura en curso.");
+
     const btn = single ? $("#rwOne") : $("#rewriteAllBtn");
-    const label = btn.textContent; btn.disabled = true; btn.textContent = "Reescribiendo…";
+    const label = btn?.textContent;
+    if (btn) { btn.disabled = true; btn.textContent = "Reescribiendo…"; }
+    if (!single) switchTab("rewrite");
+
+    const batches = [];
+    for (let i = 0; i < indices.length; i += REWRITE_BATCH) batches.push(indices.slice(i, i + REWRITE_BATCH));
+    const total = indices.length, ui = progressUI(), engines = new Set(), warnings = new Set();
+    let done = 0, produced = 0;
+    failedIndices = [];
+    rewriteCtrl = new AbortController();
+    const { signal } = rewriteCtrl;
+    if (!single) ui.show();
+
     try {
-      const r = await api("/api/v1/rewrite", {
-        text: state.report.text, institution: state.report.institution.id,
-        indices, mode: $("#rwMode").value,
-      });
-      r.rewrites.forEach((w) => state.rewrites.set(w.index, { ...w, accepted: true }));
-      $("#rwEngine").textContent = `Motor: ${r.engine}${r.warning ? " · " + r.warning : ""}${r.note ? " · " + r.note : ""}`;
-      if (!r.rewrites.length) toast("El motor no propuso cambios para esos fragmentos.");
-      renderRewrites();
-      if (single) showDetail(indices[0]); else switchTab("rewrite");
-      toast(`${r.rewrites.length} propuesta(s) generadas.`);
-    } catch (err) { toast(err.message, 6000); }
-    finally { btn.disabled = false; btn.textContent = label; }
+      for (let b = 0; b < batches.length; b++) {
+        const batch = batches[b];
+        const head = `Reescribiendo lote ${b + 1} de ${batches.length}…`;
+        ui.set(done, total, head, `${done}/${total} oraciones procesadas`);
+
+        let ok = false;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS && !ok; attempt++) {
+          try {
+            const r = await api("/api/v1/rewrite", {
+              segments: buildSegments(batch),
+              institution: state.report.institution.id,
+              mode: $("#rwMode").value,
+            }, { signal });
+            r.rewrites.forEach((w) => state.rewrites.set(w.index, { ...w, accepted: true }));
+            produced += r.rewrites.length;
+            engines.add(r.engine); if (r.warning) warnings.add(r.warning); if (r.note) warnings.add(r.note);
+            renderRewrites();                                   // resultados parciales visibles
+            ok = true;
+          } catch (err) {
+            if (err.name === "AbortError") throw err;
+            if (!err.retryable || attempt === MAX_ATTEMPTS) {
+              console.warn(`Lote ${b + 1} falló:`, err.message);
+              warnings.add(`Lote ${b + 1}: ${err.message}`);
+              break;
+            }
+            // 429 => esperar lo que indica el servidor; 5xx/red => backoff exponencial.
+            const wait = err.status === 429 ? Math.max(err.retryAfter || 10, 3) : 2 ** attempt * 1.5;
+            for (let t = Math.ceil(wait); t > 0; t--) {
+              ui.set(done, total, head, err.status === 429
+                ? `Cuota de Gemini alcanzada: reintentando en ${t} s (intento ${attempt + 1}/${MAX_ATTEMPTS})`
+                : `Error temporal (${err.status || "red"}): reintentando en ${t} s`);
+              await sleep(1000, signal);
+            }
+          }
+        }
+        if (!ok) failedIndices.push(...batch);
+        done += batch.length;
+        ui.set(done, total, `Reescribiendo lote ${Math.min(b + 2, batches.length)} de ${batches.length}…`,
+               `${done}/${total} oraciones procesadas · ${produced} propuestas`);
+        if (b < batches.length - 1) await sleep(PAUSE_BETWEEN_BATCHES, signal);
+      }
+      finishRewrite(ui, { total, produced, engines, warnings, single, indices });
+    } catch (err) {
+      if (err.name === "AbortError") {
+        failedIndices.push(...indices.filter((i) => !state.rewrites.has(i) && !failedIndices.includes(i)));
+        ui.set(done, total, "Reescritura cancelada", `${produced} propuestas conservadas`);
+        toast("Reescritura cancelada. Las propuestas ya generadas se conservan.");
+      } else { toast(err.message, 6000); }
+      renderRetry();
+    } finally {
+      rewriteCtrl = null;
+      $("#rwCancel")?.classList.add("hidden");
+      if (btn && document.body.contains(btn)) { btn.disabled = false; btn.textContent = label; }
+    }
+  }
+
+  function finishRewrite(ui, { total, produced, engines, warnings, single, indices }) {
+    const failed = failedIndices.length;
+    ui.set(total, total, failed ? `Completado con ${failed} oración(es) sin procesar` : "Reescritura completada",
+           `${produced} propuestas generadas de ${total} oraciones`);
+    $("#rwEngine").textContent = `Motor: ${[...engines].join(", ") || "—"}${warnings.size ? " · " + [...warnings].join(" · ") : ""}`;
+    renderRewrites(); renderRetry();
+    if (single) { showDetail(indices[0]); if (!produced) toast("El motor no propuso cambios para esta oración."); return; }
+    toast(failed ? `${produced} propuestas generadas; ${failed} oraciones fallaron (puedes reintentarlas).`
+                 : `${produced} propuesta(s) generadas.`, 5000);
+    if (!failed) setTimeout(() => !rewriteCtrl && ui.hide(), 4000);
+  }
+
+  function renderRetry() {
+    let el = $("#rwRetry");
+    if (!failedIndices.length) { el?.remove(); return; }
+    if (!el) {
+      el = document.createElement("button");
+      el.id = "rwRetry"; el.className = "btn"; el.type = "button";
+      el.addEventListener("click", () => rewrite([...failedIndices]));
+      $("#rwProgress .rw-progress-foot").appendChild(el);
+    }
+    el.textContent = `Reintentar ${failedIndices.length} fallida(s)`;
   }
 
   $("#rewriteAllBtn").addEventListener("click", () => rewrite(state.report?.rewrite_targets || []));

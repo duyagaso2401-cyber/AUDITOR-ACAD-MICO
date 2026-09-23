@@ -90,7 +90,15 @@ Respuesta (resumen):
 }
 ```
 
-Otros endpoints: `POST /api/v1/rewrite` (`text`, `indices`, `institution`, `mode`), `POST /api/v1/export` (devuelve .docx), `POST /api/v1/extract`, `GET /api/v1/institutions`, `GET /health`. Añada `"compact": true` a `/audit` para respuestas livianas.
+**Reescritura por lotes** — `POST /api/v1/rewrite` procesa como máximo `REWRITE_MAX_PER_REQUEST` (5) oraciones por petición y responde en ≤ `REWRITE_TIME_BUDGET` (20 s):
+
+```json
+{"segments": [{"index": 12, "text": "…", "before": "…", "after": "…"}], "institution": "upel", "mode": "fluido"}
+```
+
+También acepta `{"text": "…", "indices": [..]}`: procesa los primeros 5 y devuelve `"pending"` con los que faltan. Códigos: `400` petición inválida, `413` demasiados segmentos, `429` cuota de Gemini (con `Retry-After`; reintente ese lote), `500` error inesperado (JSON con `request_id`). Si Gemini tarda demasiado o rechaza la clave, el lote se resuelve con el motor local y la respuesta incluye `warning`.
+
+Otros endpoints: `POST /api/v1/export` (devuelve .docx), `POST /api/v1/extract`, `GET /api/v1/institutions`, `GET /health`. Añada `"compact": true` a `/audit` para respuestas livianas.
 
 Para añadir una universidad, agregue un `Institution` en `services/institutions.py` (guía de estilo, formato de página y umbrales).
 

@@ -30,10 +30,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from services.ai_detector import detect_ai
 from services.documents import ExtractionError, build_docx, extract_text
-from services.gemini_client import GeminiClient
+from services.gemini_client import GeminiClient, GeminiRateLimitError
 from services.institutions import get_institution, list_institutions
 from services.plagiarism import available_providers, check_plagiarism
-from services.rewriter import MODES, apply_rewrites, rewrite_sentences
+from services.rewriter import (BATCH_SIZE, MAX_SEGMENT_CHARS, MODES, Segment, apply_rewrites,
+                               rewrite_segments, rewrite_sentences, segments_from_sentences)
 from services.text_utils import detect_language, normalize, split_sentences
 
 load_dotenv()
@@ -42,6 +43,12 @@ APP_VERSION = "1.0.0"
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "80000"))
 MIN_TEXT_CHARS = 80
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "20"))
+# Reescritura: máximo de oraciones por petición HTTP y segundos máximos por petición.
+# 5 oraciones ≈ 1-2 lotes de Gemini ≈ 4-10 s: muy por debajo del timeout del proxy.
+REWRITE_MAX_PER_REQUEST = int(os.getenv("REWRITE_MAX_PER_REQUEST", "5"))
+REWRITE_TIME_BUDGET = float(os.getenv("REWRITE_TIME_BUDGET", "20"))
+# Las peticiones de reescritura por lotes son muchas y pequeñas: tienen su propio límite.
+REWRITE_RATE_LIMIT_PER_MIN = int(os.getenv("REWRITE_RATE_LIMIT_PER_MIN", "40"))
 API_KEYS = {k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()}
 CORS_ORIGINS = {o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()}
 
@@ -93,6 +100,7 @@ class RateLimiter:
 
 
 limiter = RateLimiter(RATE_LIMIT_PER_MIN)
+rewrite_limiter = RateLimiter(REWRITE_RATE_LIMIT_PER_MIN)
 
 
 def api_error(message: str, status: int = 400, **extra):
@@ -104,7 +112,7 @@ def _valid_api_key(key: str | None) -> bool:
     return bool(key) and any(hmac.compare_digest(key, k) for k in API_KEYS)
 
 
-def protected(rate_limited: bool = True):
+def protected(rate_limited: bool = True, bucket: RateLimiter | None = None):
     """Autoriza por X-API-Key (integraciones) o por sesión del dashboard.
     Si API_KEYS no está definida, la API queda abierta (modo desarrollo/demo)."""
     def decorator(fn):
@@ -115,7 +123,7 @@ def protected(rate_limited: bool = True):
                 return api_error("API key inválida o ausente (cabecera X-API-Key)", 401)
             if rate_limited:
                 client = key or request.remote_addr or "anon"
-                ok, retry = limiter.allow(client)
+                ok, retry = (bucket or limiter).allow(client)
                 if not ok:
                     resp, status = api_error("Límite de peticiones excedido", 429, retry_after=retry)
                     resp.headers["Retry-After"] = str(retry)
@@ -243,7 +251,8 @@ def run_audit(text: str, opts: dict) -> dict:
     targets = [s["index"] for s in sentence_map if s["flag"] in ("plagio", "ia_alta", "ia_media")]
     rewrite = None
     if auto_rewrite and targets:
-        rewrite = rewrite_sentences(sentences, targets, institution, gemini, opts.get("mode", "fluido"))
+        rewrite = rewrite_sentences(sentences, targets[:REWRITE_MAX_PER_REQUEST * 3], institution, gemini,
+                                    opts.get("mode", "fluido"), budget=REWRITE_TIME_BUDGET)
         rewrite["corrected_text"] = apply_rewrites(text, sentences, rewrite["rewrites"])
 
     ai_pct = ai["ai_probability"]
@@ -374,27 +383,106 @@ def api_audit():
     return jsonify(report)
 
 
+def _parse_segments(raw) -> list[Segment]:
+    """Valida el formato ligero: [{"index": int, "text": str, "before"?: str, "after"?: str}]."""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("'segments' debe ser una lista no vacía")
+    out = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"segments[{i}] debe ser un objeto")
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            raise ValueError(f"segments[{i}].index debe ser un entero") from None
+        text = normalize(str(item.get("text") or ""))
+        if not text:
+            raise ValueError(f"segments[{i}].text está vacío")
+        out.append(Segment(index=index, text=text[:MAX_SEGMENT_CHARS],
+                           before=str(item.get("before") or "")[-400:],
+                           after=str(item.get("after") or "")[:400]))
+    return out
+
+
 @app.post("/api/v1/rewrite")
-@protected()
+@protected(bucket=rewrite_limiter)
 def api_rewrite():
-    body = request.get_json(silent=True) or {}
-    text = normalize(body.get("text", ""))
-    if (err := _validate_text(text)):
-        return err
+    """
+    Reescritura por lotes pequeños. Cada petición procesa como máximo
+    REWRITE_MAX_PER_REQUEST oraciones y responde en ≤ REWRITE_TIME_BUDGET s.
+
+    Modo A – ligero (recomendado, lo usa el dashboard): sólo se envían las oraciones
+    y su contexto local, nunca el documento completo.
+        {"segments": [{"index": 12, "text": "...", "before": "...", "after": "..."}],
+         "institution": "upel", "mode": "fluido"}
+
+    Modo B – por índices (integraciones): se envía el texto y los índices; el servidor
+    procesa los primeros N y devuelve "pending" con los que faltan para la siguiente llamada.
+        {"text": "...", "indices": [3, 7, 12, ...], "institution": "upel"}
+
+    Errores: 400 (petición inválida), 413 (demasiados segmentos), 429 (cuota de Gemini o
+    límite de la API, con Retry-After), 500 (error inesperado, siempre en JSON).
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return api_error("El cuerpo debe ser JSON", 400)
     institution = get_institution(body.get("institution"))
-    sentences = split_sentences(text)
-    indices = body.get("indices")
-    if not indices:
-        # Sin índices: se reescriben las oraciones con mayor riesgo local.
-        ai = detect_ai(sentences, text, detect_language(text), institution, None, use_semantic=False)
-        indices = [s["index"] for s in ai["per_sentence"] if s["score"] >= 40]
+    mode = body.get("mode", "fluido")
+    pending: list[int] = []
+    corrected_text = None
+
     try:
-        indices = [int(i) for i in indices][:200]
-    except (TypeError, ValueError):
-        return api_error("'indices' debe ser una lista de enteros")
-    result = rewrite_sentences(sentences, indices, institution, gemini, body.get("mode", "fluido"))
-    result["corrected_text"] = apply_rewrites(text, sentences, result["rewrites"])
-    return jsonify({"ok": True, "institution": institution.id, **result})
+        if "segments" in body:
+            segments = _parse_segments(body["segments"])
+            if len(segments) > REWRITE_MAX_PER_REQUEST:
+                return api_error(f"Máximo {REWRITE_MAX_PER_REQUEST} segmentos por petición; "
+                                 f"divida la solicitud en lotes", 413,
+                                 max_per_request=REWRITE_MAX_PER_REQUEST)
+            full_text, sentences = None, None
+        else:
+            full_text = normalize(body.get("text", ""))
+            if (err := _validate_text(full_text)):
+                return err
+            sentences = split_sentences(full_text)
+            indices = body.get("indices")
+            if not indices:
+                ai = detect_ai(sentences, full_text, detect_language(full_text), institution, None,
+                               use_semantic=False)
+                indices = [s["index"] for s in ai["per_sentence"] if s["score"] >= 45]
+            if not isinstance(indices, list):
+                raise ValueError("'indices' debe ser una lista de enteros")
+            indices = sorted({int(i) for i in indices if 0 <= int(i) < len(sentences)})
+            pending = indices[REWRITE_MAX_PER_REQUEST:]
+            segments = segments_from_sentences(sentences, indices[:REWRITE_MAX_PER_REQUEST])
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+    try:
+        result = rewrite_segments(segments, institution, gemini, mode,
+                                  budget=REWRITE_TIME_BUDGET, raise_rate_limit=True)
+    except GeminiRateLimitError as exc:
+        retry = max(1, int(round(exc.retry_after)))
+        resp, status = api_error("Cuota de Gemini excedida temporalmente; reintente este lote", 429,
+                                 retry_after=retry, retryable=True)
+        resp.headers["Retry-After"] = str(retry)
+        return resp, status
+    except Exception as exc:  # noqa: BLE001 – nunca un 500 en HTML ni sin contexto
+        log.exception("Fallo inesperado en reescritura: %s", exc)
+        return api_error("Error inesperado al reescribir este lote", 500, retryable=True)
+
+    if full_text is not None and sentences is not None:
+        corrected_text = apply_rewrites(full_text, sentences, result["rewrites"])
+    return jsonify({
+        "ok": True,
+        "institution": institution.id,
+        "processed": [s.index for s in segments],
+        "pending": pending,
+        "done": not pending,
+        "max_per_request": REWRITE_MAX_PER_REQUEST,
+        "batch_size": BATCH_SIZE,
+        **result,
+        **({"corrected_text": corrected_text} if corrected_text is not None else {}),
+    })
 
 
 @app.post("/api/v1/export")

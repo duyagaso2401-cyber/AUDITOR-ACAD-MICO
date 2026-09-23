@@ -16,11 +16,16 @@ ideas tomadas de otros autores deben seguir citándose aunque se parafraseen.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import random
 import re
+import time
+from dataclasses import dataclass
 
-from .gemini_client import GeminiClient, GeminiError
+from .gemini_client import (GeminiAuthError, GeminiClient, GeminiError, GeminiRateLimitError,
+                            GeminiTimeoutError)
 from .institutions import Institution
 from .text_utils import TRANSITIONS_EN, TRANSITIONS_ES, Sentence
 
@@ -42,38 +47,94 @@ _SYSTEM = (
     "mismo idioma del original. Responde SOLO con JSON válido."
 )
 
-BATCH_SIZE = 25
+# Oraciones por llamada a Gemini. Lotes pequeños => cada llamada tarda pocos segundos
+# y consume pocos tokens por minuto (clave en el plan gratuito de Gemini y de Render).
+BATCH_SIZE = max(1, int(os.getenv("REWRITE_BATCH_SIZE", "4")))
+CONTEXT_CHARS = 220          # contexto local antes/después de cada oración
+MAX_SEGMENT_CHARS = 1500     # una "oración" más larga que esto se recorta al validar
+
+
+@dataclass
+class Segment:
+    """Unidad mínima de reescritura: la oración y su contexto local inmediato.
+    Nunca se envía el documento completo a Gemini."""
+    index: int
+    text: str
+    before: str = ""
+    after: str = ""
+
+
+def segments_from_sentences(sentences: list[Sentence], targets: list[int]) -> list[Segment]:
+    out = []
+    for i in sorted({i for i in targets if 0 <= i < len(sentences)}):
+        out.append(Segment(
+            index=i, text=sentences[i].text,
+            before=sentences[i - 1].text[-CONTEXT_CHARS:] if i > 0 else "",
+            after=sentences[i + 1].text[:CONTEXT_CHARS] if i + 1 < len(sentences) else "",
+        ))
+    return out
+
+
+def rewrite_segments(segments: list[Segment], institution: Institution, client: GeminiClient | None,
+                     mode: str = "fluido", budget: float | None = None,
+                     raise_rate_limit: bool = True) -> dict:
+    """
+    Reescribe segmentos en lotes de ``BATCH_SIZE`` respetando un presupuesto de tiempo.
+
+    * ``GeminiRateLimitError`` se propaga (si ``raise_rate_limit``) para que la API responda
+      429 + Retry-After y el cliente reintente ese lote, en vez de degradar la calidad.
+    * Timeout, clave inválida u otros fallos de Gemini => respaldo local por reglas y
+      ``warning`` explicativo, para que el usuario siempre obtenga un resultado.
+    """
+    mode = mode if mode in MODES else "fluido"
+    if not segments:
+        return {"engine": "none", "mode": mode, "rewrites": []}
+    if not (client and client.enabled):
+        return _rewrite_local(segments)
+
+    deadline = time.monotonic() + budget if budget else None
+    rewrites: list[dict] = []
+    for b in range(0, len(segments), BATCH_SIZE):
+        batch = segments[b:b + BATCH_SIZE]
+        remaining = (deadline - time.monotonic()) if deadline else None
+        try:
+            if remaining is not None and remaining < 4:
+                raise GeminiTimeoutError("Presupuesto de tiempo agotado")
+            rewrites += _rewrite_with_gemini(batch, institution, client, mode, remaining)
+        except GeminiRateLimitError:
+            if raise_rate_limit:
+                raise
+            return _with_local_fallback(rewrites, segments[b:], "cuota de Gemini excedida", client)
+        except GeminiTimeoutError:
+            return _with_local_fallback(rewrites, segments[b:], "Gemini tardó demasiado", client)
+        except GeminiAuthError as exc:
+            return _with_local_fallback(rewrites, segments[b:], str(exc), client)
+        except GeminiError as exc:
+            log.warning("Lote de reescritura falló: %s", exc)
+            return _with_local_fallback(rewrites, segments[b:], "respuesta inválida de Gemini", client)
+    return {"engine": f"gemini:{client.model}", "mode": mode, "rewrites": rewrites}
+
+
+def _with_local_fallback(done: list[dict], pending: list[Segment], reason: str, client) -> dict:
+    local = _rewrite_local(pending)
+    return {"engine": f"gemini:{client.model}+local-rules" if done else "local-rules",
+            "mode": "mixto" if done else "reglas",
+            "rewrites": done + local["rewrites"],
+            "warning": f"{len(pending)} oración(es) procesadas con el motor local: {reason}."}
 
 
 def rewrite_sentences(sentences: list[Sentence], targets: list[int], institution: Institution,
-                      client: GeminiClient | None, mode: str = "fluido") -> dict:
-    targets = sorted({i for i in targets if 0 <= i < len(sentences)})
-    if not targets:
-        return {"engine": "none", "rewrites": []}
-    mode = mode if mode in MODES else "fluido"
-
-    if client and client.enabled:
-        try:
-            rewrites = []
-            for b in range(0, len(targets), BATCH_SIZE):
-                rewrites += _rewrite_with_gemini(sentences, targets[b:b + BATCH_SIZE],
-                                                 institution, client, mode)
-            return {"engine": f"gemini:{client.model}", "mode": mode, "rewrites": rewrites}
-        except GeminiError as exc:
-            log.warning("Reescritura Gemini falló, se usa respaldo local: %s", exc)
-            result = _rewrite_local(sentences, targets)
-            result["warning"] = f"Gemini no disponible ({exc}); se aplicó el motor local."
-            return result
-    return _rewrite_local(sentences, targets)
+                      client: GeminiClient | None, mode: str = "fluido",
+                      budget: float | None = None, raise_rate_limit: bool = False) -> dict:
+    """Compatibilidad: reescribe por índices a partir de la lista completa de oraciones."""
+    return rewrite_segments(segments_from_sentences(sentences, targets), institution, client,
+                            mode, budget, raise_rate_limit)
 
 
-def _rewrite_with_gemini(sentences, targets, institution, client, mode) -> list[dict]:
-    items = []
-    for i in targets:
-        prev_s = sentences[i - 1].text if i > 0 else ""
-        next_s = sentences[i + 1].text if i + 1 < len(sentences) else ""
-        items.append(f'{{"index": {i}, "before": {_q(prev_s[-220:])}, '
-                     f'"text": {_q(sentences[i].text)}, "after": {_q(next_s[:220])}}}')
+def _rewrite_with_gemini(batch: list[Segment], institution: Institution, client: GeminiClient,
+                         mode: str, budget: float | None) -> list[dict]:
+    items = [{"index": s.index, "before": s.before[-CONTEXT_CHARS:], "text": s.text,
+              "after": s.after[:CONTEXT_CHARS]} for s in batch]
     prompt = f"""NORMA INSTITUCIONAL: {institution.name}
 Estilo de citación: {institution.citation_style}
 Guía de estilo: {institution.style_guide}
@@ -85,27 +146,28 @@ Devuelve un arreglo JSON con este formato:
 [{{"index": <int>, "rewritten": "<oración reescrita>", "changes": ["<cambio breve>", ...]}}]
 
 ELEMENTOS:
-[{", ".join(items)}]"""
-    data = client.generate_json(_SYSTEM, prompt, temperature=0.75, max_output_tokens=8192)
+{json.dumps(items, ensure_ascii=False)}"""
+    # ~400 tokens de salida por oración es holgado y evita respuestas truncadas.
+    data = client.generate_json(_SYSTEM, prompt, temperature=0.75,
+                                max_output_tokens=min(8192, 600 + 450 * len(batch)),
+                                retries=1, budget=budget)
     if isinstance(data, dict):
         data = data.get("rewrites") or data.get("items") or []
-    valid = set(targets)
+    by_index = {s.index: s for s in batch}
     out = []
-    for it in data or []:
+    for it in data if isinstance(data, list) else []:
+        if not isinstance(it, dict):
+            continue
         try:
             idx = int(it.get("index"))
-        except (TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError):
             continue
+        seg = by_index.get(idx)
         new = str(it.get("rewritten", "")).strip()
-        if idx in valid and new and not _drops_citations(sentences[idx].text, new):
-            out.append({"index": idx, "original": sentences[idx].text, "rewritten": new,
+        if seg and new and not _drops_citations(seg.text, new):
+            out.append({"index": idx, "original": seg.text, "rewritten": new,
                         "changes": [str(c)[:160] for c in (it.get("changes") or [])][:5]})
     return out
-
-
-def _q(s: str) -> str:
-    import json
-    return json.dumps(s, ensure_ascii=False)
 
 
 _CITATION_RE = re.compile(r"\([^()]*\d{4}[a-z]?\)|\[\d+(?:[-–,]\s*\d+)*\]|\(\d+(?:[-–,]\s*\d+)*\)")
@@ -131,11 +193,11 @@ _FILLERS = [
 ]
 
 
-def _rewrite_local(sentences: list[Sentence], targets: list[int]) -> dict:
+def _rewrite_local(segments: list[Segment]) -> dict:
     rng = random.Random(42)
     rewrites = []
-    for i in targets:
-        original = sentences[i].text
+    for seg in segments:
+        i, original = seg.index, seg.text
         new = original
         changes = []
         for pat in _FILLERS:

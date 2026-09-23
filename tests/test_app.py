@@ -94,3 +94,97 @@ def test_validation_and_auth():
         assert ok.status_code == 200
     finally:
         app_module.API_KEYS.clear()
+
+
+# ---------------------------------------------------------------- reescritura por lotes
+def _segments(n):
+    sents = split_sentences(AI_TEXT)
+    return [{"index": i, "text": sents[i % len(sents)].text, "before": "", "after": ""} for i in range(n)]
+
+
+def test_rewrite_segments_mode_and_limits():
+    c = client()
+    ok = c.post("/api/v1/rewrite", json={"segments": _segments(3), "institution": "upel"}).get_json()
+    assert ok["ok"] and ok["processed"] == [0, 1, 2] and ok["done"] and "corrected_text" not in ok
+    too_many = c.post("/api/v1/rewrite", json={"segments": _segments(app_module.REWRITE_MAX_PER_REQUEST + 1)})
+    assert too_many.status_code == 413 and too_many.get_json()["max_per_request"] == app_module.REWRITE_MAX_PER_REQUEST
+    bad = c.post("/api/v1/rewrite", json={"segments": [{"index": "x", "text": "hola"}]})
+    assert bad.status_code == 400 and bad.get_json()["ok"] is False
+    assert c.post("/api/v1/rewrite", data="no-json", content_type="text/plain").status_code == 400
+
+
+def test_rewrite_index_mode_paginates():
+    long_text = " ".join([AI_TEXT] * 3)
+    r = client().post("/api/v1/rewrite", json={"text": long_text, "indices": list(range(12))}).get_json()
+    assert len(r["processed"]) == app_module.REWRITE_MAX_PER_REQUEST
+    assert r["pending"] == list(range(app_module.REWRITE_MAX_PER_REQUEST, 12)) and r["done"] is False
+
+
+def test_rewrite_gemini_rate_limit_returns_429(monkeypatch=None):
+    from services.gemini_client import GeminiRateLimitError
+    c = client()
+    gem = app_module.gemini
+    old_key, old_fn = gem.api_key, gem.generate_json
+    gem.api_key = "x"
+    gem.generate_json = lambda *a, **k: (_ for _ in ()).throw(GeminiRateLimitError("429", retry_after=17))
+    try:
+        r = c.post("/api/v1/rewrite", json={"segments": _segments(2)})
+        assert r.status_code == 429 and r.headers["Retry-After"] == "17"
+        assert r.get_json()["retryable"] is True
+    finally:
+        gem.api_key, gem.generate_json = old_key, old_fn
+
+
+def test_rewrite_gemini_timeout_falls_back_to_local():
+    from services.gemini_client import GeminiTimeoutError
+    c = client()
+    gem = app_module.gemini
+    old_key, old_fn = gem.api_key, gem.generate_json
+    gem.api_key = "x"
+    gem.generate_json = lambda *a, **k: (_ for _ in ()).throw(GeminiTimeoutError("lento"))
+    try:
+        r = c.post("/api/v1/rewrite", json={"segments": _segments(3)})
+        body = r.get_json()
+        assert r.status_code == 200 and body["engine"] == "local-rules" and "motor local" in body["warning"]
+    finally:
+        gem.api_key, gem.generate_json = old_key, old_fn
+
+
+def test_rewrite_unexpected_error_is_json_500():
+    c = client()
+    original = app_module.rewrite_segments
+    app_module.rewrite_segments = lambda *a, **k: 1 / 0
+    try:
+        r = c.post("/api/v1/rewrite", json={"segments": _segments(1)})
+        assert r.status_code == 500 and r.is_json and r.get_json()["retryable"] is True
+    finally:
+        app_module.rewrite_segments = original
+
+
+def test_gemini_client_budget_and_429_parsing():
+    import time as _t
+    from services.gemini_client import GeminiClient, GeminiRateLimitError, GeminiTimeoutError
+
+    class Resp:
+        def __init__(self, code, body=None):
+            self.status_code, self._b, self.text, self.headers = code, body or {}, "", {}
+        def json(self):
+            return self._b
+
+    g429 = GeminiClient(api_key="k")
+    g429._session.post = lambda *a, **k: Resp(429, {"error": {"details": [{"retryDelay": "31s"}]}})
+    try:
+        g429.generate_json("s", "p", budget=10); assert False
+    except GeminiRateLimitError as e:
+        assert e.retry_after == 31          # no espera 31 s dentro de una petición de 10 s
+
+    gslow = GeminiClient(api_key="k")
+    def slow(*a, **k):
+        _t.sleep(0.01)
+        import requests; raise requests.Timeout()
+    gslow._session.post = slow
+    t0 = _t.monotonic()
+    try:
+        gslow.generate_json("s", "p", budget=4, retries=3); assert False
+    except GeminiTimeoutError:
+        assert _t.monotonic() - t0 < 4

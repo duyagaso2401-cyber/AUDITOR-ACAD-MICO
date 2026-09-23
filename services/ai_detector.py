@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import statistics
 from collections import Counter
 
@@ -241,7 +242,10 @@ def semantic_analysis(sentences: list[Sentence], institution: Institution,
         return {"available": False, "error": "Texto vacío"}
     prompt, _ = _build_semantic_prompt(sentences, institution)
     try:
-        data = client.generate_json(_SYSTEM_SEMANTIC, prompt, temperature=0.1)
+        # Presupuesto acotado: en documentos largos la auditoría no debe superar el
+        # timeout del proxy; si Gemini tarda, se entrega sólo la capa matemática.
+        data = client.generate_json(_SYSTEM_SEMANTIC, prompt, temperature=0.1, max_output_tokens=4096,
+                                    retries=1, budget=float(os.getenv("AUDIT_GEMINI_BUDGET", "22")))
     except GeminiError as exc:
         return {"available": False, "error": str(exc)}
     if not isinstance(data, dict):
